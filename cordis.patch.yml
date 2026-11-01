@@ -1,0 +1,11 @@
+# dsh-bridge bundle patch: mount the AstrBot bridge peer.
+#
+# The row is enabled when the host provides a `profileContext` (a normal profile)
+# and disabled without one. The default config has no `connections` entries, so
+# an enabled row opens no listener; adding a link means adding a connection with
+# a real `pskSecret` in the user's own patch layer. A connection without a PSK
+# refuses to start, so there is no unauthenticated listener.
+- insert:
+    - id: astrbot-bridge
+      name: 'dsh-plugin-astrbot-bridge'
+      disabled: !!js "!ctx.get('profileContext')"

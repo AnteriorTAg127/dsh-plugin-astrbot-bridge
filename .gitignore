@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# dsh-plugin-astrbot-bridge — project specific ignores
+# ---------------------------------------------------------------------------
+
+# Development process documents (never committed)
+开发/
+# Explicit duplicate guard for local API test credentials
+开发/api_config.json
+# Secrets / local credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+secrets.json
+credentials.json
+api_config.json
+# Runtime cache / dependency artifacts
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+# node_modules is a symlink to the DSH host deps; the trailing-slash rule above
+# only matches real directories, so keep this slash-less rule for the symlink.
+node_modules
+.venv/
+venv/
+# Build artifacts / distributions
+dist/
+build/
+*.egg-info/
+*.tgz
+*.zip
+*.log
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local scratch space for one-off probes and throwaway scripts. Contents are
+# never part of the package (`files` in package.json is an explicit allow-list)
+# and never committed; nothing here is required to build, test or run.
+/.probe-tmp/
