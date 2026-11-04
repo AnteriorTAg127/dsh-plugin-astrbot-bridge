@@ -3,6 +3,69 @@
 All notable changes to this plugin are recorded here. The development-process
 log lives in `开发/changelog.md`, which is not committed.
 
+## [0.2.0] - 2026-11-04
+
+Authorization authority instances (v0.2 R1): a rebuilt AstrBot database no longer
+leaves this side rejecting every snapshot.
+
+### Added
+
+- **Authority instance identity.** The cached `session.authz` table now stores
+  `instance_id` (the UUID of the A database that produced it) and
+  `instance_started_at` (Unix seconds when it was first created), and
+  `authzSnapshot()` exposes both (`null` when absent). A push whose
+  `instance_id` differs from the cached one replaces the table — even when its
+  `version` is lower — only if both sides carry a valid non-negative integer
+  `instance_started_at` and the pushed one is **strictly larger**. The same
+  instance keeps strict version monotonicity, and an absent or non-string
+  `instance_id` falls back to the v0.1 version-only rule without switching the
+  cached identity. Invalid optional values are logged and treated as absent; a
+  non-integer `version` is still `bad_params`.
+- **v0.1 upgrade path (rule 0).** A cached table with no usable `instance_id`
+  (written before this release) accepts the first complete pushed identity —
+  `instance_id` plus a valid non-negative integer `instance_started_at` — and
+  records it even when the pushed `version` is lower. Without this, a B upgraded
+  from v0.1 whose A database was rebuilt would keep rejecting the new authority.
+  A pushed id without a usable start still falls back to version monotonicity,
+  and once the identity is recorded an older-instance snapshot is refused like
+  any other replay.
+- **No downgrade replay.** A different instance whose start is missing, equal,
+  smaller, negative or non-integer is refused (`applied: false`, old table
+  kept) and logged as `authz_instance_rollback_refused`. This closes the window
+  where a replayed snapshot from an older authority could roll the cached
+  authorization table back on demand; the rule never degrades to
+  "a different instance is always accepted".
+- **Serialized pushes.** `BridgeStore.applyAuthz()` now runs its whole
+  read-check-write inside the store's existing `_serialized` write chain (the
+  same primitive as `claimApprovalRelease`), so two concurrent pushes cannot
+  both read the old table and let the lower-version one overwrite the
+  higher-version one and drop a grant.
+- **Approval-claim cache follows the instance.** `ApprovalService.syncAuthz()`
+  now keys its decision on `(instance_id, instance_started_at, version)` and
+  rebuilds for a strictly later instance, a higher version of the same instance,
+  or the first complete identity when the cache is still empty (the v0.1
+  upgrade path). An older instance snapshot never rebuilds it, and an id without
+  a usable start follows version monotonicity without recording a partial
+  identity, so a replay cannot resurrect a revoked grant; a failed table read
+  still clears the cache (fail-closed).
+- **Regression coverage.** `tests/authz-instance.test.mjs` now covers
+  the v0.1 upgrade path and its missing-start fallback, the rollback guard after
+  an upgrade, same-instance monotonicity, valid and refused instance switches,
+  `instance_started_at` equal/missing/invalid cases, the T-05 downgrade replay,
+  concurrent pushes, the missing-field fallbacks and the approval cache
+  rebuild/refusal/fail-closed paths against a real
+  `BridgeStore`/`ApprovalService`. `tests/session-authz-fixture.test.mjs` adds
+  five cross-end contract cases driven by the byte-identical A-side
+  `tests/fixtures/session_authz_v02.json`, covering the real snapshot shape, the
+  upgrade path and the refused older-instance replay.
+
+### Changed
+
+- Agent-auto session creation preserves both cached instance fields when it
+  bumps the local table, so a local quota bump cannot erase the authority
+  identity or weaken the rollback guard.
+- Package version is now `0.2.0`.
+
 ## [0.1.0] - 2026-10-30
 
 First implementation of the DSH side of `dsh-bridge/v1`.
@@ -122,6 +185,11 @@ First implementation of the DSH side of `dsh-bridge/v1`.
 
 ### Known limitations
 
+- **Known operational edges.** Rule 0 re-arms if the local `authz/current` record
+  is deleted or corrupted, and `instance_started_at` is second-granular, so a
+  same-second authority rebuild is refused rather than rolled back. Both are
+  documented fail-safe/operational limits (README "Known limitations") and
+  queued for v0.3 hardening.
 - **Not verified in a real environment (BLOCKED-ENV).** No real DSH host
   assembly, no real AstrBot peer, no real IM platform, no real LLM route, no real
   OpenAPI/SSE run, no real TLS, no cross-machine network. Everything above is

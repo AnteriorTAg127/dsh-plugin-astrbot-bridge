@@ -10,14 +10,16 @@ without TLS.
 > scanner does not load it. The entry point is the Cordis plugin in
 > `lib/index.js`.
 
-**Status: `0.1.0`.** Current snapshot (2026-11-01): **377 passed / 0 failed**
-(`node --test 'tests/**/*.test.mjs'`), A `427 passed`, A+B real-socket business
-roundtrip **24 passed**, cross-transport **26 passed**, independent crypto
-verification 36/36, and `tsc -p tsconfig.json --noEmit` exit 0. The §12.7
-`approval.lookup` amendment is implemented and validated in unit/business tests.
-The plugin has **not** been exercised against a real DSH host, a real AstrBot
-peer, a real LLM route, real OpenAPI/SSE or real network conditions — those
-remain **BLOCKED-ENV**. Read "Known limitations" before deploying.
+**Status: `0.2.0`.** Current B-side snapshot (2026-11-04): **424 passed / 0 failed**
+(`node --test 'tests/**/*.test.mjs'`, 0 skipped; 47 v0.2 R1 cases) and
+`tsc -p tsconfig.json --noEmit` exit 0. The cross-repo figures remain the v0.1
+baseline and were not re-run for `0.2.0`: A `427 passed`, A+B real-socket
+business roundtrip **24 passed**, cross-transport **26 passed**, independent
+crypto verification 36/36. The §12.7 `approval.lookup` amendment is implemented
+and validated in unit/business tests. The plugin has **not** been exercised
+against a real DSH host, a real AstrBot peer, a real LLM route, real OpenAPI/SSE
+or real network conditions — those remain **BLOCKED-ENV**. Read "Known
+limitations" before deploying.
 
 ## What it does
 
@@ -318,6 +320,44 @@ $DSH_HOME/bridge/astrbot/
 └── wake/        # per-root-task wake budget
 ```
 
+### 5. Authority instances and database rebuilds
+
+A is the sole authorization authority. Every A database carries an
+`instance_id` (a UUID, not a credential) and the `instance_started_at` Unix
+timestamp of when that database was first created; each `session.authz` snapshot
+names both. This side accepts a **complete replacement** from a different
+instance even when its `version` is lower, but only when the push carries a
+strictly larger `instance_started_at`. That is what makes a rebuild survivable:
+recreating A's `bridge.db` restarts `version` at 0 with a later start timestamp,
+so the rebuilt authority is accepted. Within one instance the version stays
+strictly monotonic.
+
+The ordering condition is a security requirement, not a detail. Without it, a
+replayed snapshot from an *older* instance — which may carry a much higher
+version — could roll the cached table back to an old authorization state on
+demand. Such a push is refused (`applied: false`, old table kept) and logged as
+`authz_instance_rollback_refused`; a switch whose start is missing, equal,
+smaller, negative or non-integer is refused the same way. The rule never
+degrades to "a different instance is always accepted". A snapshot that omits
+`instance_id` (an older A) falls back to the version-only v0.1 rule and does not
+switch the cached instance identity.
+
+Upgrading from v0.1 is a one-time exception. A cached table written before these
+fields existed has no identity, so the first complete snapshot from a rebuilt A
+(id plus a valid `instance_started_at`) is accepted and recorded even when its
+`version` is lower; otherwise the very upgrade this release targets would still
+be refused. A pushed id without a usable start does not take that path and falls
+back to version monotonicity. Once the identity is recorded, an older-instance
+snapshot is refused exactly like any other replay.
+
+The instance fields grant nothing and authenticate nothing: the grants still come
+one-for-one from the authenticated A, and `instance_started_at` is only an
+ordering hint. The same `(instance_id, instance_started_at, version)` rule drives
+the approval-claim cache, so after a rebuild an old session can no longer be
+claimed with the stale table, while a replayed older-instance snapshot cannot
+resurrect a revoked grant there either. A failed read of the table still clears
+that cache (fail-closed: unknown is not allowed).
+
 ## Tools exposed to the model
 
 | Tool | Purpose |
@@ -394,11 +434,11 @@ Set-Location <path>\dsh-plugin-astrbot-bridge; npm test
 Set-Location <path>\dsh-plugin-astrbot-bridge; npm run test:all
 ```
 
-> `npm test` selects the 30 root `tests/*.test.mjs` files; `npm run test:all`
+> `npm test` selects the 32 root `tests/*.test.mjs` files; `npm run test:all`
 > uses `tests/**/*.test.mjs`, so it covers every root and nested test file. There
 > are no nested test files today, but the full-suite acceptance command uses
 > `test:all` so a future nested suite cannot be silently skipped. The current
-> full-suite count is **377 passed** against the host dependency tree.
+> full-suite count is **424 passed** against the host dependency tree.
 
 Golden-vector subset:
 
@@ -432,13 +472,21 @@ The A-side cross-transport suite is **POSIX-only** (`/proc`, process groups,
 
 ### Test status (historical snapshot, not current acceptance)
 
-- **Current full-suite snapshot:** `node --test 'tests/**/*.test.mjs'` →
-  **377 passed / 0 failed / 0 skipped** (exit 0, 33.63s, `v24.20.0`,
-  `DSH_HOME`/data root at a temporary directory), recorded 2026-11-01.
-- **Cross-repo current snapshot:** A `427 passed` (28.27s); A+B real-socket
-  business roundtrip **24 passed** (248.38s); cross-transport **26 passed**
-  (160.19s); independent crypto verification 36/36. Earlier 394/355/348/310/247
-  counts and the 22-case business snapshot are obsolete.
+- **Current B-side full-suite snapshot:** `node --test 'tests/**/*.test.mjs'` →
+  **424 passed / 0 failed / 0 skipped** (exit 0, 34.67s, `v24.20.0`,
+  `DSH_HOME`/data root at a temporary directory), recorded 2026-11-04 and
+  including the 42 v0.2 R1 authority-instance cases (v0.1 upgrade path,
+  downgrade replay, unorderable switches, serialized concurrent pushes,
+  approval-cache rebuild/refusal, fail-closed read).
+  `tests/session-authz-fixture.test.mjs` adds five cross-end contract cases that
+  read the byte-identical A-side fixture `tests/fixtures/session_authz_v02.json`
+  and pin the real snapshot shape, the v0.1 upgrade path and the refused
+  older-instance replay, including the approval-claim cache.
+- **Cross-repo snapshot (v0.1 baseline, not re-run for `0.2.0`):** A
+  `427 passed` (28.27s); A+B real-socket business roundtrip **24 passed**
+  (248.38s); cross-transport **26 passed** (160.19s); independent crypto
+  verification 36/36. Earlier 394/355/348/310/247 counts and the 22-case
+  business snapshot are obsolete.
 - **Real host acceptance is still `BLOCKED-ENV`.** No real DSH/AstrBot host,
   IM, LLM, OpenAPI/SSE or TLS run has been performed.
 - `tsc -p tsconfig.json --noEmit` exits 0 on the current `lib/` tree (the
@@ -503,10 +551,23 @@ application code never touches a socket.
   real AstrBot peer, no real IM platform, no real LLM call, no real OpenAPI/SSE
   run, no real TLS, no cross-machine network. All evidence is local:
   unit/protocol tests and loopback sockets.
-- **Real-host final acceptance is still `BLOCKED-ENV`.** The current
-  377/427/24/26/36 snapshot validates unit logic, loopback business flows, the
-  cross-transport carriers and crypto only; it must not be quoted as a real-host
-  result.
+- **Real-host final acceptance is still `BLOCKED-ENV`.** The 424-test B suite
+  (with the 427/24/26/36 cross-repo figures from the v0.1 baseline) validates
+  unit logic, loopback business flows, the cross-transport carriers and crypto
+  only; it must not be quoted as a real-host result.
+- **The one-time upgrade path can reopen if the local cache is wiped.** Rule 0
+  (`no cached identity -> accept the first complete identity`) only applies while
+  the cached `authz/current` record has no usable `instance_id`. Deleting or
+  corrupting that record therefore re-arms the path: one older-instance snapshot
+  would be accepted and the table rolled back. The channel is authenticated and
+  the frame `seq` window rejects replays, so this is an operational invariant
+  (do not hand-edit the authz record), not a new attack surface; persisting a
+  "identity was once recorded" marker is a v0.3 hardening item.
+- **`instance_started_at` has one-second resolution.** If the authority database is
+  rebuilt within the same second, the new and old values are equal and rule 4
+  refuses the new instance even with a higher version. That is the fail-safe
+  direction (no sync instead of a rollback); clear the peer's `authz/current`
+  record and let it push again. Millisecond/monotonic ordering is a v0.3 item.
 - **Type checking passes.** `tsc -p tsconfig.json --noEmit` exits 0; record shapes
   and parameter annotations were made explicit instead of disabling `checkJs` or
   excluding files.
