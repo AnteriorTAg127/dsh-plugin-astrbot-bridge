@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-astrbot-bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DSH-side peer bridge: AstrBot <-> DeepSeek Harness task, session, approval and image exchange over an authenticated, encrypted channel.",
   "type": "module",
   "main": "lib/index.js",

@@ -112,6 +112,34 @@ export interface Config {
   allowedSessionPurposes?: string[];
   /** Bridge data root; empty resolves under the harness home. */
   dataRoot?: string;
+  /**
+   * Explicit model route for bridge-started turns (R3).
+   *
+   * Precedence: this override, then `modelByPurpose`, then the host default
+   * (`agentDefaultModel.currentSelection()`). When none resolves, the task fails
+   * at the delivery boundary with `capability_unavailable` /
+   * `no_model_route`; `session.create` still succeeds without a route.
+   *
+   * **Volatile**: an edit takes effect on the next delivery without reloading
+   * the plugin, so live agents and connections survive the change.
+   */
+  modelOverride?: ModelRouteConfig;
+  /**
+   * Per-purpose model route map, consulted when `modelOverride` is unset.
+   *
+   * **Volatile**, like `modelOverride`.
+   */
+  modelByPurpose?: Record<string, ModelRouteConfig>;
+}
+
+/** One model route (R3: only these fields ever reach the host). */
+export interface ModelRouteConfig {
+  /** Provider id; empty means unset. */
+  provider?: string;
+  /** Model id; empty means unset. */
+  model?: string;
+  /** Optional reasoning effort; empty means the provider default. */
+  reasoningEffort?: string;
 }
 
 /** Services this plugin requires. */

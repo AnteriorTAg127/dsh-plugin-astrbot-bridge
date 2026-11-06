@@ -3,6 +3,101 @@
 All notable changes to this plugin are recorded here. The development-process
 log lives in `开发/changelog.md`, which is not committed.
 
+## [0.3.0] - 2026-11-06
+
+DSH-side model routing, live configuration, and honest turn outcomes (v0.3
+R3–R6). No wire/frame, `LABEL`, crypto, AAD or golden-vector change; `inject`
+and the entry module's export set are unchanged.
+
+### Added
+
+- **Model routing (R3).** Every delivery resolves a route in order:
+  `modelOverride` → `modelByPurpose[purpose]` → host default
+  (`ctx.get('agentDefaultModel').currentSelection()`). The route is applied at
+  `AgentHost.deliver`, so `session.create` keeps working on a profile with no
+  default model. With no resolvable route the task fails with
+  `capability_unavailable` / `details.reason = "no_model_route"` and no agent is
+  created, resumed or woken. Only `provider`/`model`/`reasoningEffort` reach the
+  host (`maxTokens` is dropped), and `agent_created` logs `provider`/`model`/
+  `source` (`explicit` for caller-supplied options, else `override`/`purpose`/
+  `default`).
+- **Mid-session model switch (R4).** Routes are switched through
+  `installModelSelection(agent.ctx, ref)` + `ref.current`, never by editing
+  `agent.options` (after the first turn the request seed comes from the
+  persisted header, so options-only edits would split the prompt from the real
+  route). `deliver()` is the single refresh point: the change lands on a later
+  step/turn and an in-flight request is never interrupted. A failed refresh
+  keeps the previous route and logs `model_route_refresh_failed` at `warn`.
+  The host's `[model changed: …]` user-role notice is passed through untouched.
+- **Live model configuration (R5).** `modelOverride` and `modelByPurpose` are
+  volatile schemastery leaves, read once per delivery through a closure: an edit
+  takes effect on the next delivery without restarting the plugin, dropping the
+  connection or disposing live agents. They are deliberately excluded from
+  `normaliseConfig`'s spread/clamp so a volatile ref never becomes an opaque
+  value in the plain settings object. Volatile fields also make the namespace
+  appear in `settings.describe()`; secrets keep their redaction.
+- **Honest turn outcomes and answer extraction (R6).** The host adapter
+  subscribes to `agent/error` and to `session/event`'s `turn/start`,
+  `assistant/message` and `turn/end`. A turn that ended with `error` fails the
+  task (`error.code = "agent_turn_failed"`); a turn with no attributable evidence
+  (`blocked`, unknown reason kind, no event bus) parks it as `needs_human`
+  (`error.code = "agent_outcome_unknown"`). For a `completed` / `max-tokens`
+  turn, the `type: "text"` blocks of the **last** `assistant/message` in the turn
+  are concatenated and reported as `result.text`; that turn succeeds only when
+  the text is non-empty. A completed turn with no assistant text parks as
+  `needs_human` with `error.code = "agent_output_missing"` instead of returning
+  an empty answer. A retried error followed by a completed turn is a success,
+  and the bridge's own cancel is not reported as a failure. Only events with
+  `turn >= armedTurn` count (the next `turn/start` after arming, or the turn
+  already open for a steer), so a late `turn/end` or assistant message from the
+  previous turn cannot decide this delivery (M-4). The probe is optional, so
+  hosts/doubles without it keep the old path.
+- **Selection installed from the start (L-2).** `createSession` already installed
+  the resolved route (including the host-default route); `resumeSession` now does
+  too, instead of waiting for the first `deliver()`. The host's
+  `[model changed: …]` notice compares the assembled route with the persisted
+  request header, so starting the selection machine at the session's own route
+  keeps an unchanged route free of a manufactured notice. A real change is still
+  announced.
+- `tests/model-routing.test.mjs` (11 cases) and `tests/turn-failure.test.mjs`
+  (12 cases) exercise these behaviours against a real
+  `BridgeStore`/`ApprovalService` and minimal host doubles with optional-method
+  semantics. The R6 extraction, empty-output, stale-turn and L-2 resume cases
+  were red against the pre-fix working tree (7 failures) and are green with this
+  change; run against the pristine `0.2.0` tree the whole v0.3 set is red.
+
+### Changed
+
+- `normaliseConfig()` no longer carries the volatile model policy keys into the
+  plain settings object.
+- Deliveries now carry the task `purpose` to the host, so the purpose route map
+  is applied at the point that actually drives a turn.
+- `lib/types/index.d.ts` documents `modelOverride`, `modelByPurpose` and
+  `ModelRouteConfig`.
+
+### Notes / honest boundaries
+
+- Policy approvals (auto-approval) are deferred to v0.4 and are not supported in
+  this release.
+- Real-host acceptance stays **BLOCKED-ENV**: `agentDefaultModel` and
+  `installModelSelection` were validated against local doubles, not a live DSH
+  host; GUI form auto-generation for the new namespace and profile-patch hot
+  reload are **unverified**.
+- A concurrent GUI per-session model selection can install a second selection
+  alongside the bridge's; the bridge treats its own model selection as
+  authoritative and external per-session selection is unsupported.
+- `turn/end.reason.kind` was checked against the installed
+  `@deepseek-ai/dsh-agent-loop` `0.2.1-rc.2` source: `completed`, `blocked`,
+  `aborted` (reason such as `user`), `error`, `max-tokens`. `assistant/message`
+  was checked the same way (`{turn, step, message, interrupted?, usage?,
+  stream?}` with a content-block array); only `text` blocks are extracted.
+- **`0 skipped` is a run-environment fact, not a suite property.** Ten
+  conditional `t.skip(...)` branches in four older suites skip silently when a
+  host package cannot be imported; the 447-passed figure assumes the host
+  dependency tree is installed.
+- The original "local UI and remote human both answer, first answer wins"
+  approval race is still **unimplemented** (claim-or-hand-back remains).
+
 ## [0.2.0] - 2026-11-04
 
 Authorization authority instances (v0.2 R1): a rebuilt AstrBot database no longer

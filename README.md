@@ -10,10 +10,12 @@ without TLS.
 > scanner does not load it. The entry point is the Cordis plugin in
 > `lib/index.js`.
 
-**Status: `0.2.0`.** Current B-side snapshot (2026-11-04): **424 passed / 0 failed**
-(`node --test 'tests/**/*.test.mjs'`, 0 skipped; 47 v0.2 R1 cases) and
-`tsc -p tsconfig.json --noEmit` exit 0. The cross-repo figures remain the v0.1
-baseline and were not re-run for `0.2.0`: A `427 passed`, A+B real-socket
+**Status: `0.3.0`.** Current B-side snapshot (2026-11-06): **447 passed / 0 failed**
+(`node --test 'tests/**/*.test.mjs'`, 0 skipped in this run; 23 v0.3 R3/R4/R5/R6
+cases) and `tsc -p tsconfig.json --noEmit` exit 0. **`0 skipped` is a property of
+this environment, not of the suite:** ten conditional `t.skip(...)` branches in
+four older suites skip silently when a host package cannot be imported. The cross-repo figures remain
+the v0.1 baseline and were not re-run for `0.3.0`: A `427 passed`, A+B real-socket
 business roundtrip **24 passed**, cross-transport **26 passed**, independent
 crypto verification 36/36. The §12.7 `approval.lookup` amendment is implemented
 and validated in unit/business tests. The plugin has **not** been exercised
@@ -78,6 +80,121 @@ limitations" before deploying.
   degrades to placeholders, and a route that does **not** declare
   `inputModalities` at all is treated as `unknown` and degrades too (fail
   closed) — the reason is reported in `result.degraded`.
+
+## Model routing, live reload, and turn outcomes (v0.3)
+
+These four behaviours exist because the bridge used to create agents with an
+empty route and then report every failed turn as a success. They are implemented
+at the boundaries named below; nothing here adds an `inject` service or a new
+export of the entry module.
+
+### Model route (R3): resolved at delivery, fail closed
+
+Every bridge-started turn resolves a route in this order:
+
+1. the volatile plugin override `modelOverride` (`provider`/`model`/
+   `reasoningEffort`), when both ids are non-empty;
+2. the volatile `modelByPurpose[purpose]` map;
+3. the host default — `ctx.get('agentDefaultModel').currentSelection()`, which
+   re-reads the host's own volatile config refs on every call.
+
+The resolved route is applied at the **delivery boundary** (`AgentHost.deliver`).
+`createSession` still resolves a route when one exists (so `session.create` and
+cold resumes are routed from the first turn), but it never fails closed: a
+profile with no default model can still create a session, exactly as before.
+When a delivery resolves **no** route at all, the task fails with
+`capability_unavailable` and `details.reason = "no_model_route"`; no agent is
+created, resumed or woken. Only `provider`/`model`/`reasoningEffort` ever reach
+the host (`maxTokens` is deliberately not forwarded), and `agent_created` logs
+carry `provider`/`model`/`source` (`explicit` for a caller-supplied route,
+otherwise `override`/`purpose`/`default`).
+
+### Mid-session model switch (R4): next step, never an interruption
+
+A route change is applied through the host's own mechanism:
+`installModelSelection(agent.ctx, ref)` (from `@deepseek-ai/dsh-agent`, the
+version pinned by this plugin) plus a write to `ref.current`. **`agent.options`
+is never rewritten** — after the first turn the request seed comes from the
+persisted header, so editing options would make `{{provider}}`/`{{model}}` in
+the prompt disagree with the model the request actually uses. The selection
+covers both the prompt assembly and the real `agent/request` route and snapshots
+per step, so a change lands on a later step or turn and never aborts an in-flight
+request.
+
+The selection is installed when the session is created **and when it is cold
+resumed** (both use the route already resolved for it), so the first delivery
+only refreshes it. That starts the selection from the same route the session
+actually uses, which keeps an unchanged route free of a manufactured notice
+(L-2). `deliver()` remains the single **refresh** point, which is what makes "the
+next round uses the new route" true without a race. A refresh that cannot
+resolve a route keeps the previous one and logs `model_route_refresh_failed` at
+`warn`; the task continues. The host appends a `[model changed: …]` user-role
+notice to the session when the route genuinely changes — the bridge neither
+suppresses nor rewrites it, and the AstrBot side must tolerate such a message
+when it replays history.
+
+### Live configuration (R5)
+
+`modelOverride` and `modelByPurpose` are declared as **volatile** schemastery
+leaves. The host commits a volatile-only configuration diff in place, so editing
+them does **not** restart the plugin: connections stay up, live agents stay
+alive, and the next delivery reads the new value. The bridge reads them through a
+closure on every delivery (volatile refs have no watch API); the plain settings
+object never receives them — spreading or clamping a ref would turn it into an
+opaque object. Non-volatile fields (`connections`, image limits, …) still
+restart the plugin on a GUI edit, which is the host's documented behaviour.
+
+Declaring a volatile field is also what makes the namespace appear in
+`settings.describe()` at all. Whether the GUI *renders* an auto-generated form
+for it is **unverified** (see Known limitations); editing the profile patch by
+hand and the per-delivery read are the supported path. Secrets are unchanged:
+the PSK keeps `role('secret')` and is redacted from every settings view. A
+half-filled route (a provider without a model, or the reverse) is not a route and
+is ignored.
+
+### Turn outcome (R6): a failed or empty turn is never a success
+
+`whenIdle()` cannot detect a failure: the agent loop catches the turn error and
+still reports idle. The bridge therefore subscribes to the host's `agent/error`
+event and to `session/event`'s durable `turn/start`, `assistant/message` and
+`turn/end` events, then both classifies the turn and extracts its answer at the
+task boundary:
+
+| Evidence | Task result |
+|---|---|
+| `turn/end.reason.kind === "error"` | `failed`, `error.code = "agent_turn_failed"` |
+| `agent/error` with no closing `turn/end` | `failed`, `agent_turn_failed` |
+| `turn/end` `completed` / `max-tokens` **and** assistant text | `succeeded`, `result.text` is that text |
+| `turn/end` `completed` / `max-tokens` **without** assistant text | `needs_human`, `error.code = "agent_output_missing"` |
+| `aborted {reason: user}` (the bridge's own cancel owns the status) | success path when text exists; otherwise `needs_human` (`agent_output_missing`), and the durable cancellation still wins |
+| no attributable evidence (`blocked`, unknown kind, no event bus) | `needs_human`, `error.code = "agent_outcome_unknown"` |
+
+Extraction rules: only `{ type: "text", text }` content blocks of
+`assistant/message` are kept; blocks of one message are concatenated in order,
+and **the last assistant message in the turn replaces earlier ones**. A
+multi-step turn therefore answers with its final assistant message, never with
+the concatenation of intermediate tool-calling steps. An assistant message that
+contains only tool calls contributes no text and does not fall back to an
+earlier message.
+
+Turn attribution: arming a delivery records the turn boundary, and only events
+with `turn >= armedTurn` count. An idle agent's boundary is opened by the next
+`turn/start`; a steer into a running turn uses that already-open turn. A late
+`turn/end` or assistant message from the previous turn is ignored, so a delivery
+cannot inherit the previous turn's failure or answer (M-4).
+
+`max-tokens` is not a failure, and `aborted` is a cancellation. A host double
+that does not implement the probe at all keeps the pre-v0.3 path (no
+`takeTurnOutcome`, therefore no turn/empty-output verdict); the five fake-host
+suites are unaffected because the probe is always optional. `agent_output_missing`
+is a task-level error code carried in the existing `task.event.error` field, not
+a protocol/error-code vocabulary change. `result.attachments` stays `[]` and
+`result.degraded` keeps the delivery's vision degradation flags.
+
+### Policy approvals (deferred to v0.4)
+
+Policy approvals (auto-approval) are deferred to v0.4 and are not supported in
+this release.
 
 ## Requirements
 
@@ -227,6 +344,8 @@ bridge database.** Configuration files are the only place it lives.
 | `imageEnabled` | `true` | Accept image attachments |
 | `imageAllowedMime` | gif/jpeg/png/webp | Accepted media types |
 | `remoteNativeApproval` | `true` | Claim harness approvals and forward them; `false` serves only the local UI |
+| `modelOverride` | `{}` | **Volatile** explicit route (`provider`/`model`/`reasoningEffort`); wins over the purpose map and the host default |
+| `modelByPurpose` | `{}` | **Volatile** purpose → route map, read per delivery |
 | `allowedSessionPurposes` | `[]` | Local purpose allow-list; empty means any |
 | `dataRoot` | `''` → `DSH_HOME/bridge/astrbot` | Bridge data root |
 | `taskRetentionDays` | `7` | Retention for finished tasks and delivered notifications |
@@ -434,11 +553,14 @@ Set-Location <path>\dsh-plugin-astrbot-bridge; npm test
 Set-Location <path>\dsh-plugin-astrbot-bridge; npm run test:all
 ```
 
-> `npm test` selects the 32 root `tests/*.test.mjs` files; `npm run test:all`
+> `npm test` selects the 34 root `tests/*.test.mjs` files; `npm run test:all`
 > uses `tests/**/*.test.mjs`, so it covers every root and nested test file. There
 > are no nested test files today, but the full-suite acceptance command uses
 > `test:all` so a future nested suite cannot be silently skipped. The current
-> full-suite count is **424 passed** against the host dependency tree.
+> full-suite count is **447 passed** against the host dependency tree, with ten
+> conditional `t.skip(...)` branches in four older suites that skip when a host
+> package cannot be imported. A `0 skipped` line therefore describes the run
+> environment, not the suite.
 
 Golden-vector subset:
 
@@ -473,16 +595,23 @@ The A-side cross-transport suite is **POSIX-only** (`/proc`, process groups,
 ### Test status (historical snapshot, not current acceptance)
 
 - **Current B-side full-suite snapshot:** `node --test 'tests/**/*.test.mjs'` →
-  **424 passed / 0 failed / 0 skipped** (exit 0, 34.67s, `v24.20.0`,
-  `DSH_HOME`/data root at a temporary directory), recorded 2026-11-04 and
-  including the 42 v0.2 R1 authority-instance cases (v0.1 upgrade path,
-  downgrade replay, unorderable switches, serialized concurrent pushes,
-  approval-cache rebuild/refusal, fail-closed read).
+  **447 passed / 0 failed / 0 skipped in this run** (exit 0, `v24.20.0`,
+  `DSH_HOME`/data root at a temporary directory, 41.24s), recorded 2026-11-06 and
+  including the 42 v0.2 R1 authority-instance cases and 23 v0.3 cases
+  (`tests/model-routing.test.mjs` 11, `tests/turn-failure.test.mjs` 12). The
+  v0.3 cases were run against the pristine `v0.2.0` tree first and are green
+  only with this change set; the R6 extraction/empty-output/stale-turn cases and
+  the L-2 resume case were additionally run against the pre-fix working tree and
+  were red there (7 failures) before turning green here.
+  **Caveat:** ten conditional `t.skip(...)` branches in
+  `independent-assembly`, `native-approval-host`, `storage-installation` and
+  `task-retention-clock` skip silently when a host package is missing, so
+  `0 skipped` is a statement about this environment, not about the suite.
   `tests/session-authz-fixture.test.mjs` adds five cross-end contract cases that
   read the byte-identical A-side fixture `tests/fixtures/session_authz_v02.json`
   and pin the real snapshot shape, the v0.1 upgrade path and the refused
   older-instance replay, including the approval-claim cache.
-- **Cross-repo snapshot (v0.1 baseline, not re-run for `0.2.0`):** A
+- **Cross-repo snapshot (v0.1 baseline, not re-run for `0.3.0`):** A
   `427 passed` (28.27s); A+B real-socket business roundtrip **24 passed**
   (248.38s); cross-transport **26 passed** (160.19s); independent crypto
   verification 36/36. Earlier 394/355/348/310/247 counts and the 22-case
@@ -551,10 +680,43 @@ application code never touches a socket.
   real AstrBot peer, no real IM platform, no real LLM call, no real OpenAPI/SSE
   run, no real TLS, no cross-machine network. All evidence is local:
   unit/protocol tests and loopback sockets.
-- **Real-host final acceptance is still `BLOCKED-ENV`.** The 424-test B suite
+- **Real-host final acceptance is still `BLOCKED-ENV`.** The 447-test B suite
   (with the 427/24/26/36 cross-repo figures from the v0.1 baseline) validates
   unit logic, loopback business flows, the cross-transport carriers and crypto
   only; it must not be quoted as a real-host result.
+- **The v0.3 routing/reload/turn-outcome work is unverified on a real host.**
+  - `agentDefaultModel.currentSelection()` and `installModelSelection` were
+    validated against local doubles only; importing `@deepseek-ai/dsh-agent` from
+    this plugin's copy and using it on the host's live agent context is argued
+    safe at code level (pure function, calls only `agentCtx.on` and
+    `createUserMessage`) but **not** proven at runtime.
+  - Whether the host GUI renders an auto-generated settings form for the bridge
+    namespace after a volatile field is declared is **unverified**; the
+    implemented path is "the value is read on every delivery", which works
+    whether or not a form exists.
+  - Whether a profile-patch YAML edit is hot-loaded (`patchReload: "live"`) is
+    **unverified**; the documented, tested path is a volatile commit through the
+    host's config editor.
+  - The bridge installs its own model selection. If a human also picks a model
+    for a bridge session in the GUI, the session controller installs a second
+    selection and the two hooks can disagree. The bridge treats its own model
+    selection as authoritative; external per-session selection is unsupported.
+  - `[model changed: …]` notices enter the session log as user-role messages;
+    the A-side replay/renderer must tolerate `source.kind = "model-selection"`.
+  - The turn-failure verdict relies on the host emitting `agent/error` and
+    `session/event`; if a profile neither provides an event bus nor these events,
+    a bridge task parks as `needs_human` rather than claiming success.
+  - The `turn/end.reason.kind` enum was checked against the installed
+    `@deepseek-ai/dsh-agent-loop` `0.2.1-rc.2` source: `completed`, `blocked`,
+    `aborted` (with `reason.kind` such as `user`), `error` and `max-tokens`.
+    `blocked` and every unrecognised kind stay `needs_human`; they are never
+    treated as success.
+  - Likewise, `assistant/message` was checked against that source: the durable
+    event data is `{ turn, step, message, interrupted?, usage?, stream? }` and
+    `message.content` is the content-block array. Only blocks with
+    `type === "text"` are extracted.
+  - The **original approval race (local UI vs. remote human, first answer wins)
+    is still not implemented** — claim-or-hand-back remains the model.
 - **The one-time upgrade path can reopen if the local cache is wiped.** Rule 0
   (`no cached identity -> accept the first complete identity`) only applies while
   the cached `authz/current` record has no usable `instance_id`. Deleting or
